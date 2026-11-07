@@ -35,6 +35,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 // Version is the semantic version of the connect module.
@@ -285,13 +287,47 @@ func (c *Client) CallServerStream(ctx context.Context, spec Spec, req any) (Clie
 	return stream, nil
 }
 
+// Revision identifies an immutable generation of a [Server]'s method
+// registry. Every successful [Server.Register] or [Server.ReplaceMethods]
+// publishes a new generation with a strictly larger revision.
+type Revision uint64
+
+// ErrRevisionConflict is returned by [Server.ReplaceMethodsIfRevision] when
+// the expected revision no longer matches the server's current revision.
+// Another publisher installed a generation in the meantime; that generation
+// stays in effect and the losing publication changes nothing.
+var ErrRevisionConflict = errors.New("connect: registry revision conflict")
+
 // Server is the procedure-to-method dispatcher. It owns the method
 // registry and the server-side interceptor chain.
+//
+// The registry is a sequence of immutable generations. [Server.Register]
+// extends a generation during setup, while [Server.ReplaceMethods] publishes
+// a complete replacement generation at runtime. Each [Server.Call] and
+// [Server.Specs] pins exactly one generation, so an in-flight RPC observes one
+// consistent registry even while another goroutine publishes a new one.
 type Server struct {
-	chain   ServerInterceptor
-	methods map[string]Method // procedure -> registered method
-	specs   []Spec
-	unknown ServerFunc // fallback for unregistered procedures, nil means CodeUnimplemented
+	chain ServerInterceptor
+
+	// mu serializes publications ([Server.Register] and
+	// [Server.ReplaceMethods]). Readers never take it: they load an immutable
+	// generation pointer atomically.
+	mu      sync.Mutex
+	current atomic.Pointer[methodGeneration]
+
+	// unknown is the fallback for unregistered procedures. A nil stored
+	// function means [CodeUnimplemented].
+	unknown atomic.Pointer[ServerFunc]
+}
+
+// methodGeneration is one immutable registry generation. After publication
+// neither the methods map nor the specs slice is mutated, so concurrent
+// readers need no lock. The handlers in methods are already wrapped with the
+// server interceptor chain.
+type methodGeneration struct {
+	revision Revision
+	methods  map[string]Method // procedure -> registered, chain-wrapped method
+	specs    []Spec            // registration order
 }
 
 // NewServer returns a dispatcher with no registered methods. The interceptors
@@ -299,38 +335,220 @@ type Server struct {
 // that need per-message behavior should wrap the [ServerStream] before
 // calling next.
 func NewServer(interceptors ...ServerInterceptor) *Server {
-	return &Server{
-		chain:   chainServerInterceptors(interceptors),
-		methods: map[string]Method{},
-	}
+	server := &Server{chain: chainServerInterceptors(interceptors)}
+	server.current.Store(&methodGeneration{methods: map[string]Method{}})
+	return server
 }
 
-// Register stores each method on the dispatcher. Each [Method.Handler] is
-// wrapped with the server-side interceptor chain so [Server.Call] is just a map
-// lookup plus one call.
+// Register stores each method on the dispatcher by publishing a new
+// generation that extends the current one. Each [Method.Handler] is wrapped
+// with the server-side interceptor chain once, so [Server.Call] is just a
+// generation lookup plus one call.
 //
-// Register panics if two methods have the same [Spec.Procedure]. Register
-// is intended for setup and must not run concurrently with [Server.Register],
-// [Server.Specs], or [Server.Call].
+// Register panics if two methods have the same [Spec.Procedure]. It is the
+// setup-time entry point and keeps appending in registration order. Runtime
+// add, replace, and remove of procedures goes through
+// [Server.ReplaceMethods] instead.
 func (s *Server) Register(methods ...Method) {
+	if len(methods) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current := s.current.Load()
+	next := &methodGeneration{
+		revision: current.revision + 1,
+		methods:  make(map[string]Method, len(current.methods)+len(methods)),
+		specs:    make([]Spec, 0, len(current.specs)+len(methods)),
+	}
+	// Existing handlers are already wrapped. Carry them over unchanged so the
+	// interceptor chain never wraps a handler a second time.
+	for _, spec := range current.specs {
+		method := current.methods[spec.Procedure]
+		next.methods[spec.Procedure] = method
+		next.specs = append(next.specs, spec)
+	}
 	for _, method := range methods {
-		if _, dup := s.methods[method.Spec.Procedure]; dup {
+		if _, dup := next.methods[method.Spec.Procedure]; dup {
 			panic(fmt.Sprintf("connect: duplicate procedure %q", method.Spec.Procedure)) //nolint:forbidigo // setup-time misuse: panic surfaces the bug at startup
 		}
 		if s.chain != nil {
 			method.Handler = s.chain(method.Handler)
 		}
-		s.methods[method.Spec.Procedure] = method
-		s.specs = append(s.specs, method.Spec)
+		next.methods[method.Spec.Procedure] = method
+		next.specs = append(next.specs, method.Spec)
 	}
+	s.current.Store(next)
 }
 
-// Specs yields the [Spec] values of registered methods. Transports use this
-// to install per-procedure routes. Specs are yielded in registration order.
-// Do not call Specs concurrently with [Server.Register].
-func (s *Server) Specs() iter.Seq[Spec] {
+// ReplaceMethods atomically publishes a new registry generation containing
+// only methods, replacing the entire current generation. Procedures absent
+// from methods are removed, repeated procedures are replaced, and new ones
+// are added, all in one publication: readers never observe a partially
+// updated table.
+//
+// The batch is validated before the current generation changes. Every
+// [Spec.Procedure] must be a leading-slash "/service/method" path without
+// whitespace, procedures must be unique within the batch, every
+// [Method.Handler] must be non-nil, and [Spec.StreamType] and
+// [Spec.IdempotencyLevel] must use the declared constants. When any method is
+// invalid, ReplaceMethods joins the validation errors and returns them
+// without touching the current generation.
+//
+// Each handler is wrapped with the server interceptor chain while preparing
+// the generation, exactly once. Calls and repeated snapshot reads never
+// re-wrap it.
+//
+// ReplaceMethods is safe to call concurrently with [Server.Call],
+// [Server.Specs], and [Server.Snapshot]. Concurrent publications serialize
+// under the server's lock; use [Server.ReplaceMethodsIfRevision] when a
+// publisher must detect that another publisher won.
+func (s *Server) ReplaceMethods(methods ...Method) (Revision, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current := s.current.Load()
+	if err := validateMethods(methods); err != nil {
+		return current.revision, err
+	}
+	generation := s.buildGeneration(current.revision+1, methods)
+	s.current.Store(generation)
+	return generation.revision, nil
+}
+
+// ReplaceMethodsIfRevision conditionally publishes methods only when the
+// current registry revision equals expected. On a mismatch it returns
+// [ErrRevisionConflict] and the current revision without changing anything:
+// a losing publisher never rolls back a generation another publisher already
+// installed. A validation failure likewise leaves the current generation in
+// place.
+func (s *Server) ReplaceMethodsIfRevision(expected Revision, methods ...Method) (Revision, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current := s.current.Load()
+	if current.revision != expected {
+		return current.revision, ErrRevisionConflict
+	}
+	if err := validateMethods(methods); err != nil {
+		return current.revision, err
+	}
+	generation := s.buildGeneration(current.revision+1, methods)
+	s.current.Store(generation)
+	return generation.revision, nil
+}
+
+// Revision returns the revision of the registry generation currently
+// published.
+func (s *Server) Revision() Revision {
+	return s.current.Load().revision
+}
+
+// buildGeneration prepares a new immutable generation from raw user methods,
+// wrapping each handler with the interceptor chain exactly once. The caller
+// must hold s.mu.
+func (s *Server) buildGeneration(revision Revision, methods []Method) *methodGeneration {
+	generation := &methodGeneration{
+		revision: revision,
+		methods:  make(map[string]Method, len(methods)),
+		specs:    make([]Spec, 0, len(methods)),
+	}
+	for _, method := range methods {
+		if s.chain != nil {
+			method.Handler = s.chain(method.Handler)
+		}
+		generation.methods[method.Spec.Procedure] = method
+		generation.specs = append(generation.specs, method.Spec)
+	}
+	return generation
+}
+
+// validateMethods verifies a replacement batch before it is published. It
+// joins every problem found so the caller can fix the whole batch at once.
+func validateMethods(methods []Method) error {
+	var errs []error
+	seen := make(map[string]struct{}, len(methods))
+	for i, method := range methods {
+		procedure := method.Spec.Procedure
+		if err := validateProcedure(procedure); err != nil {
+			errs = append(errs, fmt.Errorf("method at index %d: %w", i, err))
+		} else if _, dup := seen[procedure]; dup {
+			errs = append(errs, fmt.Errorf("method at index %d: duplicate procedure %q", i, procedure))
+		} else {
+			seen[procedure] = struct{}{}
+		}
+		if method.Handler == nil {
+			errs = append(errs, fmt.Errorf("method at index %d (%q): nil handler", i, procedure))
+		}
+		if method.Spec.StreamType > StreamTypeBidi {
+			errs = append(errs, fmt.Errorf("method at index %d (%q): invalid stream type %d", i, procedure, method.Spec.StreamType))
+		}
+		if method.Spec.IdempotencyLevel < IdempotencyUnknown || method.Spec.IdempotencyLevel > IdempotencyIdempotent {
+			errs = append(errs, fmt.Errorf("method at index %d (%q): invalid idempotency level %d", i, procedure, method.Spec.IdempotencyLevel))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// validateProcedure checks that procedure is a "/service/method" path usable
+// as an HTTP route.
+func validateProcedure(procedure string) error {
+	if procedure == "" {
+		return errors.New("procedure is empty")
+	}
+	if procedure[0] != '/' {
+		return fmt.Errorf("procedure %q must start with '/'", procedure)
+	}
+	lastSlash := strings.LastIndexByte(procedure, '/')
+	if lastSlash == 0 {
+		return fmt.Errorf("procedure %q must be /service/method", procedure)
+	}
+	if lastSlash == len(procedure)-1 {
+		return fmt.Errorf("procedure %q is missing the method segment", procedure)
+	}
+	if strings.ContainsAny(procedure, " \t\r\n") {
+		return fmt.Errorf("procedure %q must not contain whitespace", procedure)
+	}
+	return nil
+}
+
+// Snapshot returns an immutable view of the currently published generation.
+// Transports pin the snapshot before parsing a request and dispatch through
+// it, so request parsing and dispatch always observe the same generation.
+func (s *Server) Snapshot() *RegistrySnapshot {
+	return &RegistrySnapshot{server: s, generation: s.current.Load()}
+}
+
+// RegistrySnapshot is an immutable view of one registry generation. All its
+// methods observe the same [Method] values, [Spec] values, and handlers even
+// if the [Server] publishes a newer generation while the snapshot is in use.
+// A snapshot is safe to use concurrently and remains valid for the lifetime
+// of the RPCs that pinned it.
+type RegistrySnapshot struct {
+	server     *Server
+	generation *methodGeneration
+}
+
+// Revision returns the snapshot's generation revision.
+func (sn *RegistrySnapshot) Revision() Revision {
+	return sn.generation.revision
+}
+
+// Spec returns the [Spec] registered for procedure in this generation, if
+// any.
+func (sn *RegistrySnapshot) Spec(procedure string) (Spec, bool) {
+	method, ok := sn.generation.methods[procedure]
+	if !ok {
+		return Spec{}, false
+	}
+	return method.Spec, true
+}
+
+// Specs yields the [Spec] values of this generation in registration order.
+// The iterator is pinned to the generation: a publication after iteration
+// starts neither changes the yielded specs nor races with it.
+func (sn *RegistrySnapshot) Specs() iter.Seq[Spec] {
+	specs := sn.generation.specs
 	return func(yield func(Spec) bool) {
-		for _, spec := range s.specs {
+		for _, spec := range specs {
 			if !yield(spec) {
 				return
 			}
@@ -338,44 +556,71 @@ func (s *Server) Specs() iter.Seq[Spec] {
 	}
 }
 
-// Call dispatches an RPC to the method registered for procedure. Transports
-// build the [ServerStream] from their wire input, pass the per-RPC [CallInfo]
-// (or nil to let Call allocate one), and Call attaches it to ctx so user
-// handlers can read it via [CallInfoForServerContext]. Call returns the method
-// error for the transport to encode in its protocol. It does not finalize
-// protocol state. The transport does that once Call returns. Returns
-// [CodeUnimplemented] when no method is registered.
-func (s *Server) Call(ctx context.Context, procedure string, info *CallInfo, stream ServerStream) error {
+// Call dispatches an RPC through the pinned generation. It performs exactly
+// one lookup: the matched [Method], including its [Spec], [Spec.Schema], and
+// handler, serves the whole RPC, even if a newer generation changes the
+// stream type or removes the procedure before the RPC completes. Unregistered
+// procedures invoke the server's unknown handler, or fail with
+// [CodeUnimplemented] when none is set.
+func (sn *RegistrySnapshot) Call(ctx context.Context, procedure string, info *CallInfo, stream ServerStream) error {
 	if info == nil {
 		info = &CallInfo{}
 	}
 	ctx = withServerContext(ctx, info)
 	ctx = clearClientContext(ctx)
-	method, ok := s.methods[procedure]
+	method, ok := sn.generation.methods[procedure]
 	if !ok {
-		if s.unknown != nil {
-			return s.unknown(ctx, Spec{Procedure: procedure, StreamType: StreamTypeBidi}, stream)
-		}
-		return Errorf(CodeUnimplemented, "procedure %q not registered", procedure)
+		return sn.server.callUnknown(ctx, procedure, stream)
 	}
 	return method.Handler(ctx, method.Spec, stream)
 }
 
-// SetUnknownHandler sets the fallback [ServerFunc] that [Server.Call] invokes when
-// no method is registered for a procedure. The handler receives a [Spec] whose
-// Procedure is the requested procedure and whose StreamType is [StreamTypeBidi],
-// the most permissive shape, since the cardinality of an unregistered
-// procedure is unknown. Its Schema is nil. The handler is wrapped by the
-// server interceptor chain like a registered method. A nil fn restores the
-// default, which fails the call with [CodeUnimplemented].
+// callUnknown invokes the fallback handler for procedure or returns
+// [CodeUnimplemented] when no fallback is configured.
+func (s *Server) callUnknown(ctx context.Context, procedure string, stream ServerStream) error {
+	if fn := s.unknown.Load(); fn != nil && *fn != nil {
+		return (*fn)(ctx, Spec{Procedure: procedure, StreamType: StreamTypeBidi}, stream)
+	}
+	return Errorf(CodeUnimplemented, "procedure %q not registered", procedure)
+}
+
+// Specs yields the [Spec] values of the currently published generation. The
+// returned iterator pins the generation when Specs is called, so it is safe
+// to iterate while [Server.ReplaceMethods] publishes new tables. Specs are
+// yielded in registration order.
+func (s *Server) Specs() iter.Seq[Spec] {
+	return s.Snapshot().Specs()
+}
+
+// Call dispatches an RPC to the method registered for procedure. It pins the
+// current generation first, so the RPC never re-looks-up the procedure after
+// request decoding and cannot switch to a handler a concurrent publication
+// installed. Transports build the [ServerStream] from their wire input, pass
+// the per-RPC [CallInfo] (or nil to let Call allocate one), and Call attaches
+// it to ctx so user handlers can read it via
+// [CallInfoForServerContext]. Call returns the method error for the transport
+// to encode in its protocol. It does not finalize protocol state. The
+// transport does that once Call returns. Returns [CodeUnimplemented] when no
+// method is registered in the pinned generation.
+func (s *Server) Call(ctx context.Context, procedure string, info *CallInfo, stream ServerStream) error {
+	return s.Snapshot().Call(ctx, procedure, info, stream)
+}
+
+// SetUnknownHandler sets the fallback [ServerFunc] that [Server.Call] invokes
+// when no method is registered for a procedure. The handler receives a [Spec]
+// whose Procedure is the requested procedure and whose StreamType is
+// [StreamTypeBidi], the most permissive shape, since the cardinality of an
+// unregistered procedure is unknown. Its Schema is nil. The handler is wrapped
+// by the server interceptor chain like a registered method. A nil fn restores
+// the default, which fails the call with [CodeUnimplemented].
 //
-// SetUnknownHandler is intended for setup and must not run concurrently with
-// [Server.Call] or [Server.Register].
+// SetUnknownHandler is safe to call concurrently with [Server.Call]; the
+// fallback is read atomically and applies to RPCs that pin later generations.
 func (s *Server) SetUnknownHandler(fn ServerFunc) {
 	if fn != nil && s.chain != nil {
 		fn = s.chain(fn)
 	}
-	s.unknown = fn
+	s.unknown.Store(&fn)
 }
 
 // Spec describes a single RPC procedure. Generated code typically provides

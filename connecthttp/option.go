@@ -215,6 +215,19 @@ func WithConditionalOptions(conditional func(spec connect.Spec) []Option) Option
 	return conditionalOption{conditional: conditional}
 }
 
+// WithDynamicServices restricts a [NewDynamicHandler] to the given service
+// prefixes. A prefix is the leading-slash service subtree, such as
+// "/connect.ping.v1.PingService/" (a missing trailing slash is added). The
+// dynamic handler answers requests outside the allowed prefixes with a plain
+// 404, treating them as unknown services.
+//
+// Without this option, the dynamic handler serves every service present in
+// the current registry generation. [NewTransport] and [Mount] ignore this
+// option.
+func WithDynamicServices(prefixes ...string) Option {
+	return dynamicServicesOption(slices.Clone(prefixes))
+}
+
 type protocolOption struct{ name string }
 
 // apply sets the client's outgoing protocol. A client speaks exactly one
@@ -282,4 +295,11 @@ func (o conditionalOption) apply(opts *options) {
 		return
 	}
 	opts.conditional = append(opts.conditional, o.conditional)
+}
+
+type dynamicServicesOption []string
+
+func (o dynamicServicesOption) apply(opts *options) {
+	opts.dynamicServicesSet = true
+	opts.dynamicServices = append(opts.dynamicServices, o...)
 }

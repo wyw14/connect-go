@@ -13,8 +13,9 @@
 // limitations under the License.
 
 // Package connecthttp adapts [connect] onto [net/http]. It provides
-// [NewTransport] for client-side [connect.Client] values and a [Mount] entry
-// point for servers.
+// [NewTransport] for client-side [connect.Client] values, [Mount] for servers
+// that install a static route per procedure, and [NewDynamicHandler] for
+// servers whose procedure registry is replaced at runtime.
 //
 // The package implements the Connect, gRPC, and gRPC-Web wire protocols.
 package connecthttp
@@ -254,6 +255,10 @@ func defaultCompressors() []connect.Compressor {
 // plus a per-service catch-all that routes RPC requests for unknown methods
 // through [connect.Server.Call]. Non-RPC requests get a plain 404, and
 // requests for unknown services fall through to mux.
+//
+// Mount snapshots the registry once and installs static routes: procedures
+// published later with [connect.Server.ReplaceMethods] are not picked up. Use
+// [NewDynamicHandler] to serve a registry that changes at runtime.
 func Mount(mux ServeMux, server *connect.Server, options ...Option) {
 	opts := defaultOptions()
 	for _, opt := range options {
@@ -261,7 +266,7 @@ func Mount(mux ServeMux, server *connect.Server, options ...Option) {
 	}
 	services := make(map[string]struct{})
 	for spec := range server.Specs() {
-		procedureHandler := newProcedureHandler(server, spec, &opts)
+		procedureHandler := newProcedureHandler(server.Call, spec, &opts)
 		if spec.StreamType == connect.StreamTypeBidi {
 			procedureHandler = requireHTTP2(procedureHandler)
 		}
@@ -272,7 +277,7 @@ func Mount(mux ServeMux, server *connect.Server, options ...Option) {
 		}
 	}
 	for service := range services {
-		mux.Handle(service, newUnknownMethodHandler(server, &opts))
+		mux.Handle(service, newUnknownMethodHandler(server.Call, &opts))
 	}
 }
 
@@ -291,10 +296,10 @@ func requireHTTP2(next http.Handler) http.Handler {
 	})
 }
 
-// newUnknownMethodHandler routes RPC-shaped POST requests through
-// [connect.Server.Call] and 404s everything else. Connect GET requests are
-// not dispatched: an unknown method's idempotency is unknown.
-func newUnknownMethodHandler(server *connect.Server, opts *options) http.Handler {
+// newUnknownMethodHandler routes RPC-shaped POST requests through dispatch
+// and 404s everything else. Connect GET requests are not dispatched: an
+// unknown method's idempotency is unknown.
+func newUnknownMethodHandler(dispatch serverDispatch, opts *options) http.Handler {
 	classifier := &ErrorWriter{
 		protobuf:                     newReadOnlyCodecs(opts.codecs).Protobuf(),
 		requireConnectProtocolHeader: opts.requireConnectProtocolHeader,
@@ -327,7 +332,7 @@ func newUnknownMethodHandler(server *connect.Server, opts *options) http.Handler
 		}
 		// Cold path: build the handler per request to reuse the
 		// registered-procedure machinery.
-		newProcedureHandler(server, spec, opts).ServeHTTP(responseWriter, request)
+		newProcedureHandler(dispatch, spec, opts).ServeHTTP(responseWriter, request)
 	})
 }
 
@@ -438,6 +443,12 @@ type options struct {
 
 	// Server-only ([NewTransport] ignores these).
 	requireConnectProtocolHeader bool
+
+	// dynamicServices configures [NewDynamicHandler]. When
+	// dynamicServicesSet is false, the handler serves every service in the
+	// current registry generation.
+	dynamicServicesSet bool
+	dynamicServices    []string
 
 	// conditional holds per-procedure option functions registered with
 	// WithConditionalOptions. They are evaluated against each spec by forSpec.

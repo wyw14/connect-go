@@ -112,10 +112,18 @@ func newServerHandlerConfig(spec connect.Spec, opts *options) *handlerConfig {
 	}
 }
 
+// serverDispatch dispatches a parsed RPC to its [connect.Server] or, for
+// dynamic handlers, to a pinned [*connect.RegistrySnapshot]. The procedure is
+// the route path; dispatch performs the single registry lookup for the RPC.
+type serverDispatch func(ctx context.Context, procedure string, info *connect.CallInfo, stream connect.ServerStream) error
+
 // newProcedureHandler returns an [http.Handler] for a single procedure that
 // negotiates the wire protocol (reusing the v1 [Handler.ServeHTTP] skeleton)
-// and dispatches through [connect.Server.Call].
-func newProcedureHandler(server *connect.Server, spec connect.Spec, opts *options) http.Handler {
+// and dispatches through dispatch. The caller supplies the spec the handler
+// negotiates against: dynamic handlers pin it from a registry snapshot so the
+// request is never parsed with one generation's spec and dispatched with
+// another's.
+func newProcedureHandler(dispatch serverDispatch, spec connect.Spec, opts *options) http.Handler {
 	handlerCfg := newServerHandlerConfig(spec, opts.forSpec(spec))
 	protocolHandlers := handlerCfg.newProtocolHandlers()
 	unary := spec.StreamType == connect.StreamTypeUnary
@@ -126,7 +134,7 @@ func newProcedureHandler(server *connect.Server, spec connect.Spec, opts *option
 		info.Protocol = conn.Peer().Protocol
 		fromHTTPHeader(info.RequestHeader(), conn.RequestHeader())
 		stream := &handlerStream{conn: conn, info: info, unary: unary, singleRequest: singleRequest}
-		err := server.Call(ctx, spec.Procedure, info, stream)
+		err := dispatch(ctx, spec.Procedure, info, stream)
 		stream.flushHeader()
 		stream.flushTrailer()
 		return err
