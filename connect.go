@@ -35,6 +35,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // Version is the semantic version of the connect module.
@@ -287,11 +288,33 @@ func (c *Client) CallServerStream(ctx context.Context, spec Spec, req any) (Clie
 
 // Server is the procedure-to-method dispatcher. It owns the method
 // registry and the server-side interceptor chain.
+//
+// A Server also owns the shared drain lifecycle used by every transport that
+// dispatches through it: [Server.Drain] stops [Server.Call] from accepting
+// new RPCs, [Server.CancelActive] cancels the contexts of accepted calls, and
+// [Server.Shutdown] waits for accepted calls to finish. HTTP and in-process
+// entry points go through the same Server.Call boundary, so draining one
+// drains all of them.
 type Server struct {
 	chain   ServerInterceptor
 	methods map[string]Method // procedure -> registered method
 	specs   []Spec
 	unknown ServerFunc // fallback for unregistered procedures, nil means CodeUnimplemented
+
+	// lifeMu guards draining, active, and calls. No user function
+	// (interceptor, handler, or context cancellation callback) ever runs
+	// while lifeMu is held, and nothing waits on a handler while holding it.
+	lifeMu   sync.Mutex
+	lifeCond *sync.Cond // broadcast when active drops to zero
+	draining bool
+	active   int
+	calls    map[*activeCall]struct{}
+}
+
+// activeCall tracks one accepted [Server.Call] whose derived context can be
+// canceled independently of the transport's parent context.
+type activeCall struct {
+	cancel context.CancelFunc
 }
 
 // NewServer returns a dispatcher with no registered methods. The interceptors
@@ -299,10 +322,13 @@ type Server struct {
 // that need per-message behavior should wrap the [ServerStream] before
 // calling next.
 func NewServer(interceptors ...ServerInterceptor) *Server {
-	return &Server{
+	server := &Server{
 		chain:   chainServerInterceptors(interceptors),
 		methods: map[string]Method{},
+		calls:   map[*activeCall]struct{}{},
 	}
+	server.lifeCond = sync.NewCond(&server.lifeMu)
+	return server
 }
 
 // Register stores each method on the dispatcher. Each [Method.Handler] is
@@ -345,7 +371,51 @@ func (s *Server) Specs() iter.Seq[Spec] {
 // error for the transport to encode in its protocol. It does not finalize
 // protocol state. The transport does that once Call returns. Returns
 // [CodeUnimplemented] when no method is registered.
+//
+// After [Server.Drain] (or [Server.Shutdown]), Call stops at the acceptance
+// boundary: it returns [CodeUnavailable] without running any interceptor or
+// handler. A call accepted just before Drain still gets its own derived,
+// cancelable context, counts as active until it fully returns, and runs to
+// completion. The unknown-procedure fallback is counted exactly like a
+// registered method. Panics and interceptor short circuits release the active
+// slot the same way a normal return does.
 func (s *Server) Call(ctx context.Context, procedure string, info *CallInfo, stream ServerStream) error {
+	// Acceptance boundary: reserve the slot and derive the per-call context
+	// before any interceptor or handler can run, so a call accepted just
+	// before Drain still counts, and a call arriving after Drain never
+	// reaches user code. The check and the reservation are one atomic step.
+	s.lifeMu.Lock()
+	if s.draining {
+		s.lifeMu.Unlock()
+		return Errorf(CodeUnavailable, "server is draining: procedure %q is not accepting calls", procedure)
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	call := &activeCall{cancel: cancel}
+	s.calls[call] = struct{}{}
+	s.active++
+	s.lifeMu.Unlock()
+
+	// The slot is released on every exit path — normal returns, interceptor
+	// short circuits, and panics — and only when Call itself returns. Drain
+	// and Shutdown therefore observe application handlers only, never
+	// transport finalization such as footer writes or connection teardown.
+	defer func() {
+		s.lifeMu.Lock()
+		delete(s.calls, call)
+		s.active--
+		idle := s.active == 0
+		s.lifeMu.Unlock()
+		if idle {
+			// Broadcast without holding lifeMu so Shutdown waiters never
+			// wake into a held lifecycle lock.
+			s.lifeCond.Broadcast()
+		}
+		cancel() // idempotent; frees the derived context even if the parent outlives it
+		if r := recover(); r != nil {
+			panic(r) //nolint:forbidigo // preserve existing panic propagation; the slot is already released
+		}
+	}()
+
 	if info == nil {
 		info = &CallInfo{}
 	}
@@ -359,6 +429,109 @@ func (s *Server) Call(ctx context.Context, procedure string, info *CallInfo, str
 		return Errorf(CodeUnimplemented, "procedure %q not registered", procedure)
 	}
 	return method.Handler(ctx, method.Spec, stream)
+}
+
+// Drain atomically puts the server into the irreversible draining state.
+// After Drain, [Server.Call] rejects every new RPC with [CodeUnavailable]
+// before its interceptors or handler run. RPCs already accepted keep running
+// and remain counted as active until they return; the unknown-procedure
+// fallback is counted the same as a registered method.
+//
+// Drain is idempotent and never blocks on user code: it only flips the
+// lifecycle flag, so calling Drain from inside a handler cannot deadlock.
+// Draining is permanent — nothing reopens a drained server. Use [Server.Call]
+// rejection for load balancing and [Server.Shutdown] to wait for the accepted
+// calls to finish.
+func (s *Server) Drain() {
+	s.lifeMu.Lock()
+	s.draining = true
+	s.lifeMu.Unlock()
+}
+
+// CancelActive cancels the derived context of every call accepted so far that
+// is still running, including calls stuck in interceptors or the
+// unknown-procedure fallback. Cooperative handlers that select on
+// context.Done then unblock and return. A handler that ignores its context is
+// not forcibly terminated: its goroutine keeps running and stays active until
+// it actually returns.
+//
+// CancelActive does not drain the server — calls accepted afterwards receive
+// fresh contexts and are not canceled — and it does not wait for anything. It
+// is idempotent and safe to call concurrently with [Server.Call],
+// [Server.Drain], and [Server.Shutdown].
+func (s *Server) CancelActive() {
+	s.lifeMu.Lock()
+	calls := make([]*activeCall, 0, len(s.calls))
+	for call := range s.calls {
+		calls = append(calls, call)
+	}
+	s.lifeMu.Unlock()
+	// Run the cancel functions outside lifeMu so user cancellation callbacks
+	// never execute under the lifecycle lock.
+	for _, call := range calls {
+		call.cancel()
+	}
+}
+
+// Shutdown drains the server and waits for every accepted call to return, or
+// for ctx to end, whichever comes first. It is equivalent to calling
+// [Server.Drain] and then waiting for the active count to reach zero.
+//
+// Multiple callers may wait concurrently, each with its own context.
+// Canceling one waiter's context ends only that waiter's wait: the server
+// stays drained, active calls keep running, and other waiters are untouched.
+// Call Shutdown again with a fresh context to resume waiting after a timeout.
+//
+// A nil error means every application handler dispatched through
+// [Server.Call] has returned. It says nothing about the wire: transports still
+// own protocol finalization — response footers, flushes, and HTTP connection
+// teardown — so nil does not promise the peer has received the response.
+//
+// When ctx ends first, Shutdown returns a [*ShutdownError]; use [errors.As]
+// to recognize it and [errors.Is] with [context.Canceled] or
+// [context.DeadlineExceeded] to learn why the wait ended. Its Active field
+// reports how many calls were still running.
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.Drain()
+	// Each waiter wakes itself on its own context. The AfterFunc only
+	// broadcasts: it cannot clear draining, change the active count, or
+	// disturb the other waiters.
+	stop := context.AfterFunc(ctx, s.lifeCond.Broadcast)
+	defer stop()
+	s.lifeMu.Lock()
+	for s.active > 0 {
+		if err := ctx.Err(); err != nil {
+			active := s.active
+			s.lifeMu.Unlock()
+			return &ShutdownError{Active: active, err: err}
+		}
+		s.lifeCond.Wait()
+	}
+	s.lifeMu.Unlock()
+	return nil
+}
+
+// ShutdownError is returned by [Server.Shutdown] when its context ends before
+// all accepted calls have returned.
+type ShutdownError struct {
+	// Active is the number of accepted calls still running when Shutdown
+	// stopped waiting. It is zero only if the context was already ended while
+	// the server happened to be idle.
+	Active int
+
+	err error
+}
+
+// Error implements the error interface.
+func (e *ShutdownError) Error() string {
+	return fmt.Sprintf("connect: shutdown interrupted with %d active call(s): %v", e.Active, e.err)
+}
+
+// Unwrap exposes the ending context's error, so errors.Is(shutdownErr,
+// context.DeadlineExceeded) and errors.Is(shutdownErr, context.Canceled)
+// work.
+func (e *ShutdownError) Unwrap() error {
+	return e.err
 }
 
 // SetUnknownHandler sets the fallback [ServerFunc] that [Server.Call] invokes when
