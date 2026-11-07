@@ -24,14 +24,37 @@ import (
 	"connectrpc.com/connect/v2"
 )
 
+// messagePipe hands messages in one direction of a streamPair. Every
+// implementation honors the single-sender, single-receiver contract and
+// delivers messages in send order.
+type messagePipe interface {
+	// send transfers msg to the receiver. In buffered mode it returns once
+	// an independent copy of msg is accepted, not once the receiver has
+	// processed it.
+	send(ctx context.Context, msg any) error
+	// receive waits for the next message and transfers it into dst. It
+	// reports filled=true when dst was filled, even if the transfer itself
+	// returned an error. Otherwise err is the context error or io.EOF once
+	// the pipe has ended.
+	receive(ctx context.Context, dst any) (filled bool, err error)
+	// closeSend half-closes the sender side: already accepted messages stay
+	// available and are delivered in order before io.EOF.
+	closeSend()
+	// abort tears the pipe down immediately, discarding queued messages and
+	// ending every wait. It is idempotent.
+	abort()
+	// wake unblocks waits so they can re-check the context.
+	wake()
+}
+
 // streamPair wires the client and server halves of an in-process RPC
 // together. The server runs on its own goroutine, started by the client's
 // first SendHeaders, Send, or Receive.
 //
-// Each direction is a pipe guarded by mu. Receive posts its dst and waits.
-// Send copies its message straight into the posted dst. The sender may reuse
-// its message once Send returns. Every wait checks cancellation first, then a
-// delivered message, then the end of the pipe.
+// Each direction is a messagePipe guarded independently of the pair's own
+// mutex. The pair mutex only protects dispatch and response metadata, so a
+// user Clone or Copy callback running on one direction never blocks the
+// other direction.
 type streamPair struct {
 	t          *transport
 	spec       connect.Spec
@@ -45,8 +68,8 @@ type streamPair struct {
 	cancel context.CancelFunc
 
 	mu         sync.Mutex
-	request    pipe
-	response   pipe
+	request    messagePipe
+	response   messagePipe
 	started    bool
 	stopWake   func() bool // releases the context.AfterFunc that wakes waiters
 	headerSent bool
@@ -65,10 +88,8 @@ func (p *streamPair) dispatch() {
 		syncHeader(p.serverInfo.RequestHeader(), p.clientInfo.RequestHeader())
 	}
 	p.stopWake = context.AfterFunc(p.ctx, func() {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		p.request.cond.Broadcast()
-		p.response.cond.Broadcast()
+		p.request.wake()
+		p.response.wake()
 	})
 	go p.run()
 }
@@ -77,7 +98,6 @@ func (p *streamPair) dispatch() {
 func (p *streamPair) run() {
 	defer func() {
 		p.mu.Lock()
-		defer p.mu.Unlock()
 		if r := recover(); r != nil {
 			p.serverErr = connect.Errorf(connect.CodeInternal, "panic in server: %v", r)
 		}
@@ -85,8 +105,13 @@ func (p *streamPair) run() {
 		if p.clientInfo != nil {
 			syncHeader(p.clientInfo.ResponseTrailer(), p.serverInfo.ResponseTrailer())
 		}
-		p.request.close()
-		p.response.close()
+		p.mu.Unlock()
+		// The handler will never consume another request, so abandon
+		// anything still queued client-to-server. Accepted responses stay
+		// queued: the client drains them, in order, before observing the
+		// server's final state and trailers.
+		p.request.abort()
+		p.response.closeSend()
 	}()
 	p.serverErr = p.t.server.Call(p.ctx, p.spec.Procedure, &p.serverInfo, &p.server)
 }
@@ -104,81 +129,6 @@ func (p *streamPair) flushHeaders() {
 	}
 }
 
-// send waits for the receiver to post a dst and copies msg into it. It
-// returns io.EOF once the pipe has closed.
-func (p *streamPair) send(slot *pipe, msg any) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for {
-		if err := p.ctx.Err(); err != nil {
-			return err
-		}
-		if slot.closed {
-			return io.EOF
-		}
-		if slot.dst != nil {
-			break
-		}
-		slot.cond.Wait()
-	}
-	dst := slot.dst
-	slot.dst = nil
-	// Wake the receiver even if the copy panics. The receiver then fails
-	// instead of using a partial copy.
-	copied := false
-	defer func() {
-		if !copied {
-			slot.err = connect.Errorf(connect.CodeInternal, "connectinprocess: copy panicked")
-		}
-		slot.filled = true
-		slot.cond.Broadcast()
-	}()
-	slot.err = p.t.copy(dst, msg)
-	copied = true
-	return nil
-}
-
-// receive posts dst and waits for a sender to fill it. It reports whether
-// dst was filled. Otherwise err is the context error or io.EOF once the pipe
-// has closed.
-func (p *streamPair) receive(slot *pipe, dst any) (filled bool, err error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	slot.dst = dst
-	slot.cond.Broadcast()
-	for {
-		if slot.filled {
-			slot.filled = false
-			return true, slot.err
-		}
-		if err := p.ctx.Err(); err != nil {
-			slot.dst = nil
-			return false, err
-		}
-		if slot.closed {
-			slot.dst = nil
-			return false, io.EOF
-		}
-		slot.cond.Wait()
-	}
-}
-
-// pipe hands messages in one direction. The stream contract allows one sender
-// and one receiver at a time, so a single slot is enough.
-type pipe struct {
-	cond   sync.Cond
-	dst    any   // posted by a waiting Receive
-	filled bool  // set once Send has copied into dst
-	err    error // the copy result
-	closed bool  // no more messages
-}
-
-// close ends the pipe and wakes both sides. The caller must hold mu.
-func (pp *pipe) close() {
-	pp.closed = true
-	pp.cond.Broadcast()
-}
-
 // clientStream is the client-side half of a streamPair.
 type clientStream struct {
 	streamPair
@@ -188,7 +138,15 @@ type clientStream struct {
 	end error
 }
 
-func newClientStream(ctx context.Context, t *transport, spec connect.Spec) *clientStream {
+func (t *transport) newClientStream(ctx context.Context, spec connect.Spec) (*clientStream, error) {
+	if t.bounded {
+		if err := t.requestBuffer.validate("request"); err != nil {
+			return nil, err
+		}
+		if err := t.responseBuffer.validate("response"); err != nil {
+			return nil, err
+		}
+	}
 	stream := &clientStream{}
 	stream.ctx, stream.cancel = context.WithCancel(ctx)
 	stream.t = t
@@ -196,12 +154,17 @@ func newClientStream(ctx context.Context, t *transport, spec connect.Spec) *clie
 	stream.clientInfo, _ = connect.CallInfoForClientContext(ctx)
 	stream.serverInfo.Spec = spec
 	stream.server.p = &stream.streamPair
-	stream.request.cond.L = &stream.mu
-	stream.response.cond.L = &stream.mu
+	if t.bounded {
+		stream.request = newBoundedPipe(t.requestBuffer, t.clone, t.size, t.copy)
+		stream.response = newBoundedPipe(t.responseBuffer, t.clone, t.size, t.copy)
+	} else {
+		stream.request = newRendezvousPipe(&stream.mu, t.copy)
+		stream.response = newRendezvousPipe(&stream.mu, t.copy)
+	}
 	if stream.clientInfo != nil {
 		stream.clientInfo.Spec = spec
 	}
-	return stream
+	return stream, nil
 }
 
 func (s *clientStream) SendHeaders() error {
@@ -211,13 +174,13 @@ func (s *clientStream) SendHeaders() error {
 
 func (s *clientStream) Send(msg any) error {
 	s.dispatch()
-	return s.send(&s.request, msg)
+	return s.request.send(s.ctx, msg)
 }
 
+// CloseSend half-closes the request pipe: new Sends fail with io.EOF while
+// already accepted requests are delivered to the handler in order first.
 func (s *clientStream) CloseSend() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.request.close()
+	s.request.closeSend()
 	return nil
 }
 
@@ -245,11 +208,14 @@ func (s *clientStream) Receive(dst any) error {
 	return err
 }
 
-// Close cancels before closing the request side. Waiters woken by the close
-// then report the cancellation instead of a clean end.
+// Close cancels before discarding both pipes. Waiters woken by the teardown
+// then report the cancellation instead of a clean end, and queued messages
+// are released without being consumed.
 func (s *clientStream) Close() error {
 	s.cancel()
-	return s.CloseSend()
+	s.request.abort()
+	s.response.abort()
+	return nil
 }
 
 // next reads the next response. The error that ends the stream is sticky.
@@ -258,7 +224,7 @@ func (s *clientStream) next(dst any) error {
 		return s.end
 	}
 	s.dispatch()
-	filled, err := s.receive(&s.response, dst)
+	filled, err := s.response.receive(s.ctx, dst)
 	if filled {
 		return err
 	}
@@ -289,7 +255,7 @@ func (s *serverStream) SendHeaders() error {
 }
 
 func (s *serverStream) Receive(dst any) error {
-	_, err := s.p.receive(&s.p.request, dst)
+	_, err := s.p.request.receive(s.p.ctx, dst)
 	return err
 }
 
@@ -297,7 +263,304 @@ func (s *serverStream) Send(msg any) error {
 	s.p.mu.Lock()
 	s.p.flushHeaders()
 	s.p.mu.Unlock()
-	return s.p.send(&s.p.response, msg)
+	return s.p.response.send(s.p.ctx, msg)
+}
+
+// rendezvousPipe is the default, unbuffered pipe. Receive posts its dst and
+// waits; Send copies its message straight into the posted dst while holding
+// the streamPair mutex. The sender may reuse its message once Send returns.
+type rendezvousPipe struct {
+	mu     *sync.Mutex
+	cond   sync.Cond
+	copy   CopyFunc
+	dst    any   // posted by a waiting Receive
+	filled bool  // set once Send has copied into dst
+	err    error // the copy result
+	closed bool  // no more messages
+}
+
+func newRendezvousPipe(mu *sync.Mutex, copyFn CopyFunc) *rendezvousPipe {
+	pipe := &rendezvousPipe{mu: mu, copy: copyFn}
+	pipe.cond.L = mu
+	return pipe
+}
+
+func (pp *rendezvousPipe) wake() {
+	pp.cond.Broadcast()
+}
+
+// A rendezvous pipe holds no messages, so half-close and teardown are the
+// same transition.
+func (pp *rendezvousPipe) closeSend() { pp.close() }
+
+func (pp *rendezvousPipe) abort() { pp.close() }
+
+// close ends the pipe and wakes both sides.
+func (pp *rendezvousPipe) close() {
+	pp.mu.Lock()
+	defer pp.mu.Unlock()
+	pp.closed = true
+	pp.cond.Broadcast()
+}
+
+func (pp *rendezvousPipe) send(ctx context.Context, msg any) error {
+	pp.mu.Lock()
+	defer pp.mu.Unlock()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if pp.closed {
+			return io.EOF
+		}
+		if pp.dst != nil {
+			break
+		}
+		pp.cond.Wait()
+	}
+	dst := pp.dst
+	pp.dst = nil
+	// Wake the receiver even if the copy panics. The receiver then fails
+	// instead of using a partial copy. The panic itself propagates to the
+	// sender, as in the default rendezvous transport.
+	copied := false
+	defer func() {
+		if !copied {
+			pp.err = connect.Errorf(connect.CodeInternal, "connectinprocess: copy panicked")
+		}
+		pp.filled = true
+		pp.cond.Broadcast()
+	}()
+	pp.err = pp.copy(dst, msg)
+	copied = true
+	return nil
+}
+
+func (pp *rendezvousPipe) receive(ctx context.Context, dst any) (bool, error) {
+	pp.mu.Lock()
+	defer pp.mu.Unlock()
+	pp.dst = dst
+	pp.cond.Broadcast()
+	for {
+		if pp.filled {
+			pp.filled = false
+			return true, pp.err
+		}
+		if err := ctx.Err(); err != nil {
+			pp.dst = nil
+			return false, err
+		}
+		if pp.closed {
+			pp.dst = nil
+			return false, io.EOF
+		}
+		pp.cond.Wait()
+	}
+}
+
+// queuedMessage is one independent message copy held by a boundedPipe, with
+// the byte quota it consumes.
+type queuedMessage struct {
+	msg  any
+	size int64
+}
+
+// boundedPipe decouples sender and receiver with an explicitly bounded FIFO
+// queue. Send forms an independent copy before enqueuing and never retains
+// the sender's original message. Both the message count and the total byte
+// size of every enqueued, not-yet-received copy count against the limits.
+type boundedPipe struct {
+	mu       sync.Mutex
+	cond     sync.Cond
+	maxMsgs  int
+	maxBytes int64
+
+	clone CloneFunc
+	size  SizeFunc
+	copy  CopyFunc
+
+	queue []queuedMessage
+	head  int
+
+	// usedMsgs and usedBytes include copies reserved by a Send whose Clone
+	// is still running, so quota can never be overcommitted.
+	usedMsgs  int
+	usedBytes int64
+
+	sendClosed bool
+	aborted    bool
+}
+
+func newBoundedPipe(cfg BufferConfig, clone CloneFunc, size SizeFunc, copyFn CopyFunc) *boundedPipe {
+	pipe := &boundedPipe{
+		maxMsgs:  cfg.MaxMessages,
+		maxBytes: cfg.MaxBytes,
+		clone:    clone,
+		size:     size,
+		copy:     copyFn,
+	}
+	pipe.cond.L = &pipe.mu
+	return pipe
+}
+
+func (pp *boundedPipe) wake() {
+	pp.cond.Broadcast()
+}
+
+func (pp *boundedPipe) closeSend() {
+	pp.mu.Lock()
+	defer pp.mu.Unlock()
+	if pp.aborted {
+		return
+	}
+	pp.sendClosed = true
+	pp.cond.Broadcast()
+}
+
+func (pp *boundedPipe) abort() {
+	pp.mu.Lock()
+	defer pp.mu.Unlock()
+	if pp.aborted {
+		return
+	}
+	pp.aborted = true
+	pp.sendClosed = true
+	pp.queue = nil
+	pp.head = 0
+	pp.usedMsgs = 0
+	pp.usedBytes = 0
+	pp.cond.Broadcast()
+}
+
+// full reports whether a message of size would exceed either quota.
+func (pp *boundedPipe) full(size int64) bool {
+	return pp.usedMsgs >= pp.maxMsgs || pp.usedBytes+size > pp.maxBytes
+}
+
+func (pp *boundedPipe) send(ctx context.Context, msg any) error {
+	size, err := pp.size(msg)
+	if err != nil {
+		return err
+	}
+	if size < 0 {
+		return connect.Errorf(connect.CodeInternal, "connectinprocess: SizeFunc returned negative size %d", size)
+	}
+	// An oversize message can never fit, so fail before reserving quota or
+	// forming a copy.
+	if size > pp.maxBytes {
+		return connect.Errorf(
+			connect.CodeResourceExhausted,
+			"connectinprocess: message of %d bytes exceeds the %d-byte buffer limit",
+			size, pp.maxBytes,
+		)
+	}
+
+	pp.mu.Lock()
+	stopWake := context.AfterFunc(ctx, pp.cond.Broadcast)
+	defer stopWake()
+	for {
+		if err := ctx.Err(); err != nil {
+			pp.mu.Unlock()
+			return err
+		}
+		if pp.sendClosed || pp.aborted {
+			pp.mu.Unlock()
+			return io.EOF
+		}
+		if !pp.full(size) {
+			break
+		}
+		pp.cond.Wait()
+	}
+	pp.usedMsgs++
+	pp.usedBytes += size
+	pp.mu.Unlock()
+
+	// The reservation is returned on every path that does not enqueue:
+	// cancellation, close, Clone error, or a panicking Clone. Once aborted,
+	// the counters are owned by abort and must not be touched.
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		pp.mu.Lock()
+		if !pp.aborted {
+			pp.usedMsgs--
+			pp.usedBytes -= size
+		}
+		pp.cond.Broadcast()
+		pp.mu.Unlock()
+	}()
+
+	// Clone runs without holding any pipe lock, so a slow copy cannot block
+	// the other direction or the receiver.
+	clone, err := pp.clone(msg)
+	if err != nil {
+		return err
+	}
+
+	pp.mu.Lock()
+	defer pp.mu.Unlock()
+	if pp.aborted || pp.sendClosed {
+		return io.EOF
+	}
+	pp.queue = append(pp.queue, queuedMessage{msg: clone, size: size})
+	committed = true
+	pp.cond.Broadcast()
+	return nil
+}
+
+func (pp *boundedPipe) receive(ctx context.Context, dst any) (bool, error) {
+	pp.mu.Lock()
+	stopWake := context.AfterFunc(ctx, pp.cond.Broadcast)
+	defer stopWake()
+	for {
+		if pp.head < len(pp.queue) {
+			item := pp.queue[pp.head]
+			pp.queue[pp.head] = queuedMessage{}
+			pp.head++
+			if pp.head == len(pp.queue) {
+				pp.queue = pp.queue[:0]
+				pp.head = 0
+			}
+			if !pp.aborted {
+				pp.usedMsgs--
+				pp.usedBytes -= item.size
+			}
+			pp.cond.Broadcast()
+			pp.mu.Unlock()
+			// The user Copy callback runs without the pipe lock.
+			return true, pp.copyInto(dst, item.msg)
+		}
+		if pp.aborted {
+			pp.mu.Unlock()
+			if err := ctx.Err(); err != nil {
+				return false, err
+			}
+			return false, io.EOF
+		}
+		if err := ctx.Err(); err != nil {
+			pp.mu.Unlock()
+			return false, err
+		}
+		if pp.sendClosed {
+			pp.mu.Unlock()
+			return false, io.EOF
+		}
+		pp.cond.Wait()
+	}
+}
+
+// copyInto transfers a queued copy into the receiver's dst. A panicking
+// CopyFunc fails the Receive rather than crashing the receiver goroutine.
+func (pp *boundedPipe) copyInto(dst, src any) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = connect.Errorf(connect.CodeInternal, "connectinprocess: copy panicked: %v", r)
+		}
+	}()
+	return pp.copy(dst, src)
 }
 
 // asClientErr converts a server's returned error into the verdict the
